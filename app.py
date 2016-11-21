@@ -1,115 +1,33 @@
-# ref: http://flask.pocoo.org/snippets/116/
-# ref: http://stackoverflow.com/questions/12523044/how-can-i-tail-a-log-file-in-python
+# https://mortoray.com/2014/03/04/http-streaming-of-command-output-in-python-flask/
 
-import gevent
-from gevent.wsgi import WSGIServer
-from gevent.queue import Queue
+import flask
+from shelljob import proc
 
-from flask import Flask, Response
+import eventlet
 
-import time
-import threading, subprocess
+eventlet.monkey_patch()
 
-app = Flask(__name__)
-subscriptions = []
-
-def tail(filename):
-    p = subprocess.Popen(['tail','-F',filename],\
-            stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    while True:
-        line = p.stdout.readline()
-        print('Tail thread({}): {}'.format(time.time(), line))
-        for sub in subscriptions[:]:
-            sub.put(line)
-        time.sleep(2)
-
-# gevent.spawn(tail)
-t = threading.Thread(target=tail, args=('/var/log/syslog',))
-t.daemon = True
-t.start()
-
-# SSE "protocol" is described here: http://mzl.la/UPFyxY
-class ServerSentEvent(object):
-
-    def __init__(self, data):
-        self.data = data
-        self.event = None
-        self.id = None
-        self.desc_map = {
-            self.data : "data",
-            self.event : "event",
-            self.id : "id"
-        }
-
-    def encode(self):
-        if not self.data:
-            return ""
-        lines = ["%s: %s" % (v, k) 
-                 for k, v in self.desc_map.iteritems() if k]
-        
-        return "%s\n\n" % "\n".join(lines)
+app = flask.Flask(__name__)
 
 
-# Client code consumes like this.
-@app.route("/")
-def index():
-    debug_template = """
-     <html>
-       <head>
-       </head>
-       <body>
-         <h1>Server sent events</h1>
-         <div id="event"></div>
-         <script type="text/javascript">
+@app.route('/stream')
+def stream():
+    g = proc.Group()
+    p = g.run(["bash", "-c", "for ((i=0;i<100;i=i+1)); do echo $i; sleep 1; done"])
 
-         var eventOutputContainer = document.getElementById("event");
-         var evtSrc = new EventSource("/subscribe");
+    def read_process():
+        while g.is_pending():
+            lines = g.readlines()
+            for proc, line in lines:
+                yield "data:" + line + "\n\n"
 
-         evtSrc.onmessage = function(e) {
-             console.log(e.data);
-             var p = document.createElement('p');
-             p.innerHTML = e.data;
-             eventOutputContainer.appendChild(p);
-         };
+    return flask.Response(read_process(), mimetype='text/event-stream')
 
-         </script>
-       </body>
-     </html>
-    """
-    return(debug_template)
 
-@app.route("/debug")
-def debug():
-    return "Currently %d subscriptions" % len(subscriptions)
+@app.route('/')
+def get_page():
+    return flask.send_file('page.html')
 
-@app.route("/publish")
-def publish():
-    #Dummy data - pick up from request for real data
-    def notify():
-        msg = str(time.time())
-        for sub in subscriptions[:]:
-            sub.put(msg)
-    
-    gevent.spawn(notify)
-    
-    return "OK"
-
-@app.route("/subscribe")
-def subscribe():
-    def gen():
-        q = Queue()
-        subscriptions.append(q)
-        try:
-            while True:
-                result = q.get()
-                ev = ServerSentEvent(str(result))
-                yield ev.encode()
-        except GeneratorExit: # Or maybe use flask signals
-            subscriptions.remove(q)
-
-    return Response(gen(), mimetype="text/event-stream")
 
 if __name__ == "__main__":
-    app.debug = True
-    server = WSGIServer(("", 5000), app)
-    server.serve_forever()
+    app.run(debug=True)
